@@ -70,10 +70,15 @@ class AccountCapabilityTests(unittest.TestCase):
 
     def test_split_image_model_supports_plan_type_prefix(self) -> None:
         self.assertEqual(split_image_model("gpt-image-2"), (None, "gpt-image-2"))
+        self.assertEqual(split_image_model("gpt-image-2.5"), (None, "gpt-image-2.5"))
         self.assertEqual(split_image_model("plus-codex-gpt-image-2"), ("plus", "codex-gpt-image-2"))
         self.assertEqual(split_image_model("team-codex-gpt-image-2"), ("team", "codex-gpt-image-2"))
         self.assertEqual(split_image_model("pro-codex-gpt-image-2"), ("pro", "codex-gpt-image-2"))
+        self.assertEqual(split_image_model("plus-codex-gpt-image-2.5"), ("plus", "codex-gpt-image-2.5"))
+        self.assertEqual(split_image_model("team-codex-gpt-image-2.5"), ("team", "codex-gpt-image-2.5"))
+        self.assertEqual(split_image_model("pro-codex-gpt-image-2.5"), ("pro", "codex-gpt-image-2.5"))
         self.assertEqual(split_image_model("plus-gpt-image-2"), (None, None))
+        self.assertEqual(split_image_model("plus-gpt-image-2.5"), (None, None))
         self.assertEqual(split_image_model("unknown-image-model"), (None, None))
 
     def test_get_available_access_token_filters_by_plan_type(self) -> None:
@@ -218,10 +223,10 @@ class AuthServiceTests(unittest.TestCase):
             first, _ = service.create_key(role="user", name="Alice")
             second, _ = service.create_key(role="user", name="Bob")
 
-            with self.assertRaisesRegex(ValueError, "这个名称已经在使用中了"):
+            with self.assertRaisesRegex(ValueError, "This name is already in use"):
                 service.create_key(role="user", name="Alice")
 
-            with self.assertRaisesRegex(ValueError, "这个名称已经在使用中了"):
+            with self.assertRaisesRegex(ValueError, "This name is already in use"):
                 service.update_key(second["id"], {"name": "Alice"}, role="user")
 
             updated = service.update_key(first["id"], {"name": "Alice"}, role="user")

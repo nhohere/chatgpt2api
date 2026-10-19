@@ -23,7 +23,15 @@ from PIL import Image
 from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
-from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.helper import (
+    FirstOutputDeadline,
+    FirstOutputTimeout,
+    UpstreamHTTPError,
+    ensure_ok,
+    iter_sse_payloads,
+    new_uuid,
+    split_image_model,
+)
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from utils.turnstile import solve_turnstile_token
@@ -69,6 +77,10 @@ DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
 DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
+CODEX_IMAGE_MODEL_25 = "codex-gpt-image-2.5"
+CODEX_IMAGE_MODEL_25_TOOL_NAMES = {"gpt-image-2.5-flare", "gpt-image-2.5-sunburst"}
+CODEX_IMAGE_QUALITY_TIERS = {"auto", "low", "medium", "high"}
+CODEX_IMAGE_25_QUALITY_TIERS = CODEX_IMAGE_QUALITY_TIERS | {"xhigh", "max"}
 CODEX_RESPONSES_MODEL = "gpt-5.5"
 SEARCH_MODEL = "gpt-5-5"
 SEARCH_TIMEOUT_SECS = 300.0
@@ -131,6 +143,23 @@ def _is_content_policy_error(error_msg: str) -> bool:
     return any(keyword in msg_lower for keyword in _CONTENT_POLICY_KEYWORDS)
 
 
+def normalize_codex_image_quality(image_model: str, quality: str) -> str:
+    """按 Codex image_generation 工具模型规范化质量档。
+
+    - 2.5 系列工具模型（flare / sunburst）支持 auto/low/medium/high/xhigh/max。
+    - 其余工具模型（如 gpt-image-2）只支持 auto/low/medium/high：
+      xhigh/max 收敛为 high，未知档位保持原值透传（不改变既有行为）。
+    """
+    value = str(quality or "auto").strip().lower() or "auto"
+    allowed = CODEX_IMAGE_25_QUALITY_TIERS if image_model in CODEX_IMAGE_MODEL_25_TOOL_NAMES else CODEX_IMAGE_QUALITY_TIERS
+    if value in allowed:
+        return value
+    if value not in CODEX_IMAGE_25_QUALITY_TIERS:
+        return value
+    # xhigh / max 仅在 2.5 系列有效
+    return "high"
+
+
 @dataclass
 class EditableFileArtifact:
     attachment_id: str = ""
@@ -162,7 +191,7 @@ class OpenAIBackendAPI:
     - 协议兼容转换放在 `services.protocol`
     """
 
-    def __init__(self, access_token: str = "") -> None:
+    def __init__(self, access_token: str = "", deadline: FirstOutputDeadline | None = None) -> None:
         """初始化后端客户端。
 
         参数：
@@ -180,6 +209,7 @@ class OpenAIBackendAPI:
         self.session_id = self.fp["oai-session-id"]
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
+        self.deadline = deadline
         self.progress_callback: Callable[[str], None] | None = None
         self.session = requests.Session(**proxy_settings.build_session_kwargs(
             account=self.account,
@@ -235,6 +265,21 @@ class OpenAIBackendAPI:
     def __exit__(self, *args):
         self.close()
         return False
+    def _request_timeout(self, timeout_secs: float) -> float:
+        return self.deadline.request_timeout(timeout_secs) if self.deadline else timeout_secs
+
+    def _request(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return getattr(self.session, method)(*args, **kwargs)
+        except requests.exceptions.RequestException as exc:
+            if self.deadline and self.deadline.is_expired():
+                raise FirstOutputTimeout("upstream produced no first output before timeout") from exc
+            raise
+    def complete_first_output(self) -> None:
+        if self.deadline:
+            self.deadline.complete()
+            self.deadline = None
+
 
     def _build_fp(self) -> Dict[str, str]:
         account = self.account
@@ -288,31 +333,29 @@ class OpenAIBackendAPI:
 
     def _get_me(self) -> Dict[str, Any]:
         path = "/backend-api/me"
-        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
+        response = self._request("get", self.base_url + path, headers=self._headers(path), timeout=20)
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()
 
     def _get_conversation_init(self) -> Dict[str, Any]:
         path = "/backend-api/conversation/init"
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._headers(path, {"Content-Type": "application/json"}),
-            json={
-                "gizmo_id": None,
-                "requested_default_model": None,
-                "conversation_id": None,
-                "timezone_offset_min": -480,
-            },
-            timeout=20,
-        )
+        response = self._request("post", self.base_url + path,
+        headers=self._headers(path, {"Content-Type": "application/json"}),
+        json={
+            "gizmo_id": None,
+            "requested_default_model": None,
+            "conversation_id": None,
+            "timezone_offset_min": -480,
+        },
+        timeout=20,)
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()
 
     def _get_default_account(self) -> Dict[str, Any]:
         path = "/backend-api/accounts/check/v4-2023-04-27"
-        response = self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
+        response = self._request("get", self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
                                     timeout=20)
         if response.status_code != 200:
             self._raise_on_error(response, path)
@@ -568,7 +611,9 @@ class OpenAIBackendAPI:
             return "auto", ""
         if base_model == "gpt-image-2":
             upstream_model = config.default_upstream_model_name
-        elif base_model == CODEX_IMAGE_MODEL:
+        elif base_model == "gpt-image-2.5":
+            upstream_model = config.default_upstream_model_name_25 or config.default_upstream_model_name
+        elif base_model in {CODEX_IMAGE_MODEL, CODEX_IMAGE_MODEL_25}:
             upstream_model = base_model
         else:
             return "auto", ""
@@ -714,10 +759,30 @@ class OpenAIBackendAPI:
             },
         })
 
-    @staticmethod
-    def _iter_codex_response_events(raw: Any) -> Iterator[Dict[str, Any]]:
+    def _iter_codex_response_events(self, raw: Any) -> Iterator[Dict[str, Any]]:
         content_type = str(raw.headers.get("content-type") or "").lower()
-        text = raw.read().decode("utf-8", "replace")
+        chunks: list[bytes] = []
+        while True:
+            if self.deadline:
+                self.deadline.check_expired()
+                remaining = self.deadline.remaining
+                socket_obj = getattr(raw, "_sock", None)
+                if socket_obj is None:
+                    raw_fp = getattr(raw, "fp", None)
+                    raw_socket = getattr(getattr(raw_fp, "raw", None), "_sock", None)
+                    socket_obj = raw_socket
+                if socket_obj is not None and hasattr(socket_obj, "settimeout"):
+                    socket_obj.settimeout(remaining)
+            try:
+                chunk = raw.read(8192)
+            except (TimeoutError, OSError) as exc:
+                if self.deadline and self.deadline.is_expired():
+                    raise FirstOutputTimeout("upstream produced no first output before timeout") from exc
+                raise
+            if not chunk:
+                break
+            chunks.append(chunk)
+        text = b"".join(chunks).decode("utf-8", "replace")
         status_code = getattr(raw, "status", None)
         parse_errors: list[str] = []
         events: list[Dict[str, Any]] = []
@@ -778,6 +843,7 @@ class OpenAIBackendAPI:
             images: list[str] | None = None,
             size: str | None = None,
             quality: str = "auto",
+            image_model: str = "gpt-image-2",
     ) -> Iterator[Dict[str, Any]]:
         if not self.access_token:
             raise RuntimeError("access_token is required for codex image endpoints")
@@ -790,10 +856,10 @@ class OpenAIBackendAPI:
             "input": self._codex_image_input(prompt, images or []),
             "tools": [{
                 "type": "image_generation",
-                "model": "gpt-image-2",
+                "model": str(image_model or "gpt-image-2"),
                 "action": "edit" if images else "generate",
                 "size": str(size or "1024x1024"),
-                "quality": str(quality or "auto"),
+                "quality": normalize_codex_image_quality(str(image_model or "gpt-image-2"), quality),
                 "output_format": "png",
             }],
             "tool_choice": {"type": "image_generation"},
@@ -847,7 +913,7 @@ class OpenAIBackendAPI:
             },
         })
         try:
-            with urllib.request.urlopen(request, timeout=1200) as raw:
+            with urllib.request.urlopen(request, timeout=self._request_timeout(1200)) as raw:
                 yield from self._iter_codex_response_events(raw)
         except urllib.error.HTTPError as error:
             body_text = error.read().decode("utf-8", "replace")
@@ -860,6 +926,10 @@ class OpenAIBackendAPI:
             retry_after_header = error.headers.get("Retry-After") if error.headers else None
             retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
             raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
+        except (TimeoutError, OSError) as exc:
+            if self.deadline and self.deadline.is_expired():
+                raise FirstOutputTimeout("upstream produced no first output before timeout") from exc
+            raise
 
     def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
         """为图片生成准备 conduit token。"""
@@ -927,38 +997,32 @@ class OpenAIBackendAPI:
         width, height = image.size
         mime_type = Image.MIME.get(image.format, "image/png")
         path = "/backend-api/files"
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
-            json={"file_name": file_name, "file_size": len(data), "use_case": "multimodal", "width": width,
-                  "height": height},
-            timeout=60,
-        )
+        response = self._request("post", self.base_url + path,
+        headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
+        json={"file_name": file_name, "file_size": len(data), "use_case": "multimodal", "width": width,
+              "height": height},
+        timeout=self._request_timeout(60),)
         ensure_ok(response, path)
         upload_meta = response.json()
-        response = self.session.put(
-            upload_meta["upload_url"],
-            headers={
-                "Content-Type": mime_type,
-                "x-ms-blob-type": "BlockBlob",
-                "x-ms-version": "2020-04-08",
-                "Origin": self.base_url,
-                "Referer": self.base_url + "/",
-                "User-Agent": self.user_agent,
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "en-US,en;q=0.8",
-            },
-            data=data,
-            timeout=120,
-        )
+        response = self._request("put", upload_meta["upload_url"],
+        headers={
+            "Content-Type": mime_type,
+            "x-ms-blob-type": "BlockBlob",
+            "x-ms-version": "2020-04-08",
+            "Origin": self.base_url,
+            "Referer": self.base_url + "/",
+            "User-Agent": self.user_agent,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.8",
+        },
+        data=data,
+        timeout=self._request_timeout(120),)
         ensure_ok(response, "image_upload")
         path = f"/backend-api/files/{upload_meta['file_id']}/uploaded"
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
-            data="{}",
-            timeout=60,
-        )
+        response = self._request("post", self.base_url + path,
+        headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
+        data="{}",
+        timeout=self._request_timeout(60),)
         ensure_ok(response, path)
         return {
             "file_id": upload_meta["file_id"],
@@ -1035,21 +1099,19 @@ class OpenAIBackendAPI:
         if thinking_effort:
             payload["thinking_effort"] = thinking_effort
         path = "/backend-api/f/conversation"
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
-            json=payload,
-            timeout=300,
-            stream=True,
-        )
+        response = self._request("post", self.base_url + path,
+        headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+        json=payload,
+        timeout=self._request_timeout(300),
+        stream=True,)
         ensure_ok(response, path)
         return response
 
     def _get_conversation(self, conversation_id: str) -> Dict[str, Any]:
         """获取完整 conversation 详情。"""
         path = f"/backend-api/conversation/{conversation_id}"
-        response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+        response = self._request("get", self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
+                                    timeout=self._request_timeout(60))
         ensure_ok(response, path)
         return response.json()
 
@@ -1062,12 +1124,10 @@ class OpenAIBackendAPI:
             "Referer": f"{self.base_url}/c/{conversation_id}",
             "X-OpenAI-Target-Route": "/backend-api/conversation/{conversation_id}",
         })
-        response = self.session.patch(
-            self.base_url + path,
-            headers=headers,
-            json={"is_visible": False},
-            timeout=60,
-        )
+        response = self._request("patch", self.base_url + path,
+        headers=headers,
+        json={"is_visible": False},
+        timeout=60,)
         ensure_ok(response, path)
         return response.json()
 
@@ -1079,11 +1139,9 @@ class OpenAIBackendAPI:
         """
         path = f"/backend-api/conversations?offset=0&limit={limit}&order=updated&conversation_filter=all"
         try:
-            response = self.session.get(
-                self.base_url + path,
-                headers=self._headers(path, {"Accept": "application/json"}),
-                timeout=timeout_secs,
-            )
+            response = self._request("get", self.base_url + path,
+            headers=self._headers(path, {"Accept": "application/json"}),
+            timeout=self._request_timeout(timeout_secs),)
             ensure_ok(response, path)
             data = response.json()
             return data.get("items") or data.get("conversations") or []
@@ -1263,49 +1321,43 @@ class OpenAIBackendAPI:
     def _upload_editable_base64_image(self, base64_image: str, index: int) -> Dict[str, Any]:
         data, file_name, mime_type, width, height = self._decode_editable_base64_image(base64_image, index)
         path = "/backend-api/files"
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json"}),
-            json={
-                "file_name": file_name,
-                "file_size": len(data),
-                "use_case": "multimodal",
-                "timezone_offset_min": -480,
-                "reset_rate_limits": False,
-                "store_in_library": True,
-                "library_persistence_mode": "opportunistic",
-            },
-            timeout=60,
-        )
+        response = self._request("post", self.base_url + path,
+        headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json"}),
+        json={
+            "file_name": file_name,
+            "file_size": len(data),
+            "use_case": "multimodal",
+            "timezone_offset_min": -480,
+            "reset_rate_limits": False,
+            "store_in_library": True,
+            "library_persistence_mode": "opportunistic",
+        },
+        timeout=self._request_timeout(60),)
         ensure_ok(response, path)
         payload = response.json()
         upload_url = str(payload.get("upload_url") or "")
         file_id = str(payload.get("file_id") or "")
         if not upload_url or not file_id:
             raise RuntimeError(f"invalid upload response: {payload}")
-        response = self.session.put(
-            upload_url,
-            headers={
-                "Content-Type": mime_type,
-                "x-ms-blob-type": "BlockBlob",
-                "x-ms-version": "2020-04-08",
-                "Origin": self.base_url,
-                "Referer": self.base_url + "/",
-                "User-Agent": self.user_agent,
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "en-US,en;q=0.8",
-            },
-            data=data,
-            timeout=120,
-        )
+        response = self._request("put", upload_url,
+        headers={
+            "Content-Type": mime_type,
+            "x-ms-blob-type": "BlockBlob",
+            "x-ms-version": "2020-04-08",
+            "Origin": self.base_url,
+            "Referer": self.base_url + "/",
+            "User-Agent": self.user_agent,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.8",
+        },
+        data=data,
+        timeout=self._request_timeout(120),)
         ensure_ok(response, "image_upload")
         path = f"/backend-api/files/{file_id}/uploaded"
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json"}),
-            data="{}",
-            timeout=60,
-        )
+        response = self._request("post", self.base_url + path,
+        headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json"}),
+        data="{}",
+        timeout=self._request_timeout(60),)
         ensure_ok(response, path)
         return {
             "file_id": file_id,
@@ -1355,12 +1407,10 @@ class OpenAIBackendAPI:
         }
         if attachment_mime_types:
             payload["attachment_mime_types"] = attachment_mime_types
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json", "X-Conduit-Token": "no-token"}),
-            json=payload,
-            timeout=60,
-        )
+        response = self._request("post", self.base_url + path,
+        headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json", "X-Conduit-Token": "no-token"}),
+        json=payload,
+        timeout=self._request_timeout(60),)
         ensure_ok(response, path)
         conduit_token = str(response.json().get("conduit_token") or "")
         if not conduit_token:
@@ -1402,39 +1452,37 @@ class OpenAIBackendAPI:
         else:
             message["content"] = {"content_type": "text", "parts": [prompt]}
         path = "/backend-api/f/conversation"
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
-            json={
-                "action": "next",
-                "messages": [message],
-                "parent_message_id": "client-created-root",
-                "model": EDITABLE_FILE_MODEL,
-                "client_prepare_state": "sent",
-                "timezone_offset_min": -480,
-                "timezone": "Asia/Shanghai",
-                "conversation_mode": {"kind": "primary_assistant"},
-                "enable_message_followups": True,
-                "system_hints": [],
-                "supports_buffering": True,
-                "supported_encodings": ["v1"],
-                "client_contextual_info": {
-                    "is_dark_mode": False,
-                    "time_since_loaded": 401,
-                    "page_height": 1138,
-                    "page_width": 803,
-                    "pixel_ratio": 2,
-                    "screen_height": 1440,
-                    "screen_width": 2560,
-                    "app_name": "chatgpt.com",
-                },
-                "paragen_cot_summary_display_override": "allow",
-                "force_parallel_switch": "auto",
-                "thinking_effort": EDITABLE_FILE_THINKING_EFFORT,
+        response = self._request("post", self.base_url + path,
+        headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+        json={
+            "action": "next",
+            "messages": [message],
+            "parent_message_id": "client-created-root",
+            "model": EDITABLE_FILE_MODEL,
+            "client_prepare_state": "sent",
+            "timezone_offset_min": -480,
+            "timezone": "Asia/Shanghai",
+            "conversation_mode": {"kind": "primary_assistant"},
+            "enable_message_followups": True,
+            "system_hints": [],
+            "supports_buffering": True,
+            "supported_encodings": ["v1"],
+            "client_contextual_info": {
+                "is_dark_mode": False,
+                "time_since_loaded": 401,
+                "page_height": 1138,
+                "page_width": 803,
+                "pixel_ratio": 2,
+                "screen_height": 1440,
+                "screen_width": 2560,
+                "app_name": "chatgpt.com",
             },
-            timeout=300,
-            stream=True,
-        )
+            "paragen_cot_summary_display_override": "allow",
+            "force_parallel_switch": "auto",
+            "thinking_effort": EDITABLE_FILE_THINKING_EFFORT,
+        },
+        timeout=self._request_timeout(300),
+        stream=True,)
         ensure_ok(response, path)
         conversation_id = ""
         try:
@@ -1481,7 +1529,7 @@ class OpenAIBackendAPI:
 
     def _get_editable_conversation_detail(self, conversation_id: str) -> Dict[str, Any]:
         path = f"/backend-api/conversation/{conversation_id}"
-        response = self.session.get(self.base_url + path, headers=self._editable_conversation_document_headers(path, conversation_id), timeout=60)
+        response = self._request("get", self.base_url + path, headers=self._editable_conversation_document_headers(path, conversation_id), timeout=self._request_timeout(60))
         ensure_ok(response, path)
         return response.json()
 
@@ -1590,7 +1638,7 @@ class OpenAIBackendAPI:
         download_url = self._resolve_editable_download_url(conversation_id, artifact)
         if not download_url:
             raise RuntimeError(f"download url not found for artifact: {artifact}")
-        response = self.session.get(download_url, timeout=300)
+        response = self._request("get", download_url, timeout=self._request_timeout(300))
         ensure_ok(response, "artifact_download")
         content_type = self._clean_editable_mime_type(response.headers.get("Content-Type") or artifact.mime_type)
         file_name = self._resolve_editable_output_name(artifact, response.url, response.headers.get("Content-Disposition"), content_type, primary_mime_types, primary_mime_keywords, primary_default_extension)
@@ -1605,46 +1653,38 @@ class OpenAIBackendAPI:
                 ids.append(item)
         if artifact.sandbox_path and artifact.message_id:
             path = f"/backend-api/conversation/{conversation_id}/interpreter/download"
-            response = self.session.get(
-                self.base_url + path,
-                headers=self._editable_download_headers(path, conversation_id, "/backend-api/conversation/{conversation_id}/interpreter/download"),
-                params={"message_id": artifact.message_id, "sandbox_path": artifact.sandbox_path},
-                timeout=60,
-            )
+            response = self._request("get", self.base_url + path,
+            headers=self._editable_download_headers(path, conversation_id, "/backend-api/conversation/{conversation_id}/interpreter/download"),
+            params={"message_id": artifact.message_id, "sandbox_path": artifact.sandbox_path},
+            timeout=self._request_timeout(60),)
             if 200 <= response.status_code < 300:
                 url = self._download_url_from_response(response)
                 if url:
                     return url
         for attachment_id in ids:
             path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
-            response = self.session.get(
-                self.base_url + path,
-                headers=self._editable_download_headers(path, conversation_id, "/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"),
-                timeout=60,
-            )
+            response = self._request("get", self.base_url + path,
+            headers=self._editable_download_headers(path, conversation_id, "/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"),
+            timeout=self._request_timeout(60),)
             if 200 <= response.status_code < 300:
                 url = self._download_url_from_response(response)
                 if url:
                     return url
         for file_id in ids:
             path = f"/backend-api/files/download/{file_id}"
-            response = self.session.get(
-                self.base_url + path,
-                headers=self._editable_download_headers(path, conversation_id, "/backend-api/files/download/{file_id}"),
-                params={"post_id": "", "inline": "false"},
-                timeout=60,
-            )
+            response = self._request("get", self.base_url + path,
+            headers=self._editable_download_headers(path, conversation_id, "/backend-api/files/download/{file_id}"),
+            params={"post_id": "", "inline": "false"},
+            timeout=self._request_timeout(60),)
             if 200 <= response.status_code < 300:
                 url = self._download_url_from_response(response)
                 if url:
                     return url
         for file_id in ids:
             path = f"/backend-api/files/{file_id}/download"
-            response = self.session.get(
-                self.base_url + path,
-                headers=self._editable_download_headers(path, conversation_id, "/backend-api/files/download/{file_id}"),
-                timeout=60,
-            )
+            response = self._request("get", self.base_url + path,
+            headers=self._editable_download_headers(path, conversation_id, "/backend-api/files/download/{file_id}"),
+            timeout=self._request_timeout(60),)
             if 200 <= response.status_code < 300:
                 url = self._download_url_from_response(response)
                 if url:
@@ -1828,30 +1868,32 @@ class OpenAIBackendAPI:
         conduit_token = self._prepare_search_conversation(prompt, model)
         self._bootstrap()
         conversation_id = self._run_search_conversation(prompt, conduit_token, model)
-        return self._wait_search_result(conversation_id, timeout_secs, poll_interval_secs)
+        result = self._wait_search_result(conversation_id, timeout_secs, poll_interval_secs)
+        if self.deadline:
+            self.deadline.complete()
+            self.deadline = None
+        return result
 
     def _prepare_search_conversation(self, prompt: str, model: str) -> str:
         path = "/backend-api/f/conversation/prepare"
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json", "X-Conduit-Token": "no-token"}),
-            json={
-                "action": "next",
-                "fork_from_shared_post": False,
-                "parent_message_id": "client-created-root",
-                "model": model,
-                "client_prepare_state": "success",
-                "timezone_offset_min": -480,
-                "timezone": "Asia/Shanghai",
-                "conversation_mode": {"kind": "primary_assistant"},
-                "system_hints": ["search"],
-                "partial_query": {"id": new_uuid(), "author": {"role": "user"}, "content": {"content_type": "text", "parts": [prompt]}},
-                "supports_buffering": True,
-                "supported_encodings": ["v1"],
-                "client_contextual_info": {"app_name": "chatgpt.com"},
-            },
-            timeout=60,
-        )
+        response = self._request("post", self.base_url + path,
+        headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json", "X-Conduit-Token": "no-token"}),
+        json={
+            "action": "next",
+            "fork_from_shared_post": False,
+            "parent_message_id": "client-created-root",
+            "model": model,
+            "client_prepare_state": "success",
+            "timezone_offset_min": -480,
+            "timezone": "Asia/Shanghai",
+            "conversation_mode": {"kind": "primary_assistant"},
+            "system_hints": ["search"],
+            "partial_query": {"id": new_uuid(), "author": {"role": "user"}, "content": {"content_type": "text", "parts": [prompt]}},
+            "supports_buffering": True,
+            "supported_encodings": ["v1"],
+            "client_contextual_info": {"app_name": "chatgpt.com"},
+        },
+        timeout=self._request_timeout(60),)
         ensure_ok(response, path)
         token = str(response.json().get("conduit_token") or "")
         if not token:
@@ -1861,47 +1903,45 @@ class OpenAIBackendAPI:
     def _run_search_conversation(self, prompt: str, conduit_token: str, model: str) -> str:
         requirements = self._get_chat_requirements()
         path = "/backend-api/f/conversation"
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
-            json={
-                "action": "next",
-                "messages": [{
-                    "id": new_uuid(),
-                    "author": {"role": "user"},
-                    "create_time": time.time(),
-                    "content": {"content_type": "text", "parts": [prompt]},
-                    "metadata": {
-                        "developer_mode_connector_ids": [],
-                        "selected_github_repos": [],
-                        "selected_all_github_repos": False,
-                        "system_hints": ["search"],
-                        "serialization_metadata": {"custom_symbol_offsets": []},
-                    },
-                }],
-                "parent_message_id": "client-created-root",
-                "model": model,
-                "client_prepare_state": "success",
-                "timezone_offset_min": -480,
-                "timezone": "Asia/Shanghai",
-                "conversation_mode": {"kind": "primary_assistant"},
-                "enable_message_followups": True,
-                "system_hints": [],
-                "supports_buffering": True,
-                "supported_encodings": ["v1"],
-                "force_use_search": True,
-                "client_reported_search_source": "conversation_composer_web_icon",
-                "client_contextual_info": {"is_dark_mode": False, "time_since_loaded": 36, "page_height": 925, "page_width": 886, "pixel_ratio": 2, "screen_height": 1440, "screen_width": 2560, "app_name": "chatgpt.com"},
-                "paragen_cot_summary_display_override": "allow",
-                "force_parallel_switch": "auto",
-            },
-            timeout=300,
-            stream=True,
-        )
+        response = self._request("post", self.base_url + path,
+        headers=self._image_headers(path, requirements, conduit_token, "text/event-stream"),
+        json={
+            "action": "next",
+            "messages": [{
+                "id": new_uuid(),
+                "author": {"role": "user"},
+                "create_time": time.time(),
+                "content": {"content_type": "text", "parts": [prompt]},
+                "metadata": {
+                    "developer_mode_connector_ids": [],
+                    "selected_github_repos": [],
+                    "selected_all_github_repos": False,
+                    "system_hints": ["search"],
+                    "serialization_metadata": {"custom_symbol_offsets": []},
+                },
+            }],
+            "parent_message_id": "client-created-root",
+            "model": model,
+            "client_prepare_state": "success",
+            "timezone_offset_min": -480,
+            "timezone": "Asia/Shanghai",
+            "conversation_mode": {"kind": "primary_assistant"},
+            "enable_message_followups": True,
+            "system_hints": [],
+            "supports_buffering": True,
+            "supported_encodings": ["v1"],
+            "force_use_search": True,
+            "client_reported_search_source": "conversation_composer_web_icon",
+            "client_contextual_info": {"is_dark_mode": False, "time_since_loaded": 36, "page_height": 925, "page_width": 886, "pixel_ratio": 2, "screen_height": 1440, "screen_width": 2560, "app_name": "chatgpt.com"},
+            "paragen_cot_summary_display_override": "allow",
+            "force_parallel_switch": "auto",
+        },
+        timeout=self._request_timeout(300),
+        stream=True,)
         ensure_ok(response, path)
         conversation_id = ""
         try:
-            for payload in iter_sse_payloads(response):
+            for payload in iter_sse_payloads(response, self.deadline):
                 conversation_id = conversation_id or self._find_search_value(payload, "conversation_id")
                 if payload == "[DONE]":
                     break
@@ -1917,6 +1957,8 @@ class OpenAIBackendAPI:
         last_answer = ""
         stable_hits = 0
         while time.time() < deadline:
+            if self.deadline:
+                self.deadline.check_expired()
             try:
                 last_result = self._extract_search_result(conversation_id, self._get_search_conversation(conversation_id))
             except UpstreamHTTPError as exc:
@@ -1930,7 +1972,10 @@ class OpenAIBackendAPI:
                 last_answer = answer
                 if stable_hits >= 2:
                     return last_result
-            time.sleep(poll_interval_secs)
+            if self.deadline:
+                time.sleep(min(poll_interval_secs, self.deadline.remaining))
+            else:
+                time.sleep(poll_interval_secs)
         if last_result:
             return last_result
         raise RuntimeError(f"timed out waiting for search result: {conversation_id}")
@@ -1940,7 +1985,7 @@ class OpenAIBackendAPI:
         headers = self._headers(path, {"Accept": "*/*"})
         headers["Referer"] = f"{self.base_url}/c/{conversation_id}"
         headers["X-OpenAI-Target-Route"] = "/backend-api/conversation/{conversation_id}"
-        response = self.session.get(self.base_url + path, headers=headers, timeout=60)
+        response = self._request("get", self.base_url + path, headers=headers, timeout=self._request_timeout(60))
         ensure_ok(response, path)
         return response.json()
 
@@ -2144,6 +2189,10 @@ class OpenAIBackendAPI:
         - All sleeps stay within timeout_secs; on exhaustion raises ImagePollTimeoutError.
         """
         start = time.time()
+        deadline = getattr(self, "deadline", None)
+        if deadline:
+            deadline.check_expired()
+            timeout_secs = min(float(timeout_secs), deadline.remaining)
         attempt = 0
         interval = float(config.image_poll_interval_secs)
         initial_wait = float(config.image_poll_initial_wait_secs)
@@ -2166,7 +2215,8 @@ class OpenAIBackendAPI:
         })
 
         def _remaining() -> float:
-            return timeout_secs - (time.time() - start)
+            remaining = timeout_secs - (time.time() - start)
+            return min(remaining, deadline.remaining) if deadline else remaining
 
         if has_initial_ids and config.image_settle_enabled:
             settle_for = min(config.image_settle_secs, max(0.0, _remaining()))
@@ -2203,6 +2253,8 @@ class OpenAIBackendAPI:
 
         last_task_error = ""
         while _remaining() > 0:
+            if deadline:
+                deadline.check_expired()
             attempt += 1
             # 在每次轮询时，检查 /backend-api/tasks/ 是否有错误（仅记录，不中断）
             # 内容政策违规检测通过对话文本进行（在 _find_content_policy_error_in_conversation 中）
@@ -2228,19 +2280,27 @@ class OpenAIBackendAPI:
                     "attempt": attempt,
                     "error": str(exc),
                 })
+            if deadline:
+                deadline.check_expired()
 
             try:
                 conversation = self._get_conversation(conversation_id)
             except UpstreamHTTPError as exc:
+                if deadline:
+                    deadline.check_expired()
                 if exc.status_code in (429, 500, 502, 503, 504):
                     if _retry_sleep("upstream_status", exc.status_code, None, exc.retry_after):
                         continue
                     break
                 raise
             except requests.exceptions.RequestException as exc:
+                if deadline:
+                    deadline.check_expired()
                 if _retry_sleep("network", None, str(exc), None):
                     continue
                 break
+            if deadline:
+                deadline.check_expired()
 
             for record in self._extract_image_tool_records(conversation):
                 for file_id in record["file_ids"]:
@@ -2268,6 +2328,8 @@ class OpenAIBackendAPI:
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})
             if file_ids or sediment_ids:
+                if deadline:
+                    deadline.check_expired()
                 if not config.image_check_before_hit_enabled:
                     # 先check再hit 机制关闭：直接返回首次发现的 file_ids
                     logger.info({"event": "image_poll_hit_no_settle", "conversation_id": conversation_id,
@@ -2291,12 +2353,16 @@ class OpenAIBackendAPI:
                 if wait > 0:
                     time.sleep(wait)
                     continue
+                if deadline:
+                    deadline.check_expired()
                 return file_ids, sediment_ids
             logger.debug({"event": "image_poll_wait", "conversation_id": conversation_id,
                           "elapsed_secs": round(time.time() - start, 1)})
             wait = min(interval, max(0.0, _remaining()))
             if wait > 0:
                 time.sleep(wait)
+        if deadline:
+            deadline.check_expired()
         logger.info({
             "event": "image_poll_timeout",
             "conversation_id": conversation_id,
@@ -2319,8 +2385,8 @@ class OpenAIBackendAPI:
     def _get_file_download_url(self, file_id: str) -> str:
         """获取文件下载地址。"""
         path = f"/backend-api/files/{file_id}/download"
-        response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+        response = self._request("get", self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
+                                    timeout=self._request_timeout(60))
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -2328,8 +2394,8 @@ class OpenAIBackendAPI:
     def _get_attachment_download_url(self, conversation_id: str, attachment_id: str) -> str:
         """通过 conversation 附件接口获取下载地址。"""
         path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
-        response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
+        response = self._request("get", self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
+                                    timeout=self._request_timeout(60))
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -2351,11 +2417,9 @@ class OpenAIBackendAPI:
         - 任务列表，每个任务包含 image_gen_message 等字段。
         """
         path = "/backend-api/tasks"
-        response = self.session.get(
-            self.base_url + path,
-            headers=self._headers(path, {"Accept": "application/json"}),
-            timeout=timeout_secs,
-        )
+        response = self._request("get", self.base_url + path,
+        headers=self._headers(path, {"Accept": "application/json"}),
+        timeout=self._request_timeout(timeout_secs),)
         ensure_ok(response, path)
         data = response.json()
         tasks = data.get("tasks", [])
@@ -2549,7 +2613,7 @@ class OpenAIBackendAPI:
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images = []
         for url in urls:
-            response = self.session.get(url, timeout=120)
+            response = self._request("get", url, timeout=self._request_timeout(120))
             ensure_ok(response, "image_download")
             if response.content not in images:
                 images.append(response.content)
@@ -2574,16 +2638,14 @@ class OpenAIBackendAPI:
         requirements = self._get_chat_requirements()
         path, timezone = self._chat_target()
         payload = self._conversation_payload(normalized, model, timezone, thinking_effort=thinking_effort)
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._conversation_headers(path, requirements),
-            json=payload,
-            timeout=300,
-            stream=True,
-        )
+        response = self._request("post", self.base_url + path,
+        headers=self._conversation_headers(path, requirements),
+        json=payload,
+        timeout=self._request_timeout(300),
+        stream=True,)
         ensure_ok(response, path)
         try:
-            yield from iter_sse_payloads(response)
+            yield from iter_sse_payloads(response, self.deadline)
         finally:
             response.close()
 
@@ -2651,11 +2713,9 @@ class OpenAIBackendAPI:
 
     def _bootstrap(self) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
-        response = self.session.get(
-            self.base_url + "/",
-            headers=self._bootstrap_headers(),
-            timeout=30,
-        )
+        response = self._request("get", self.base_url + "/",
+        headers=self._bootstrap_headers(),
+        timeout=self._request_timeout(30),)
         ensure_ok(response, "bootstrap")
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
         if not self.pow_script_sources:
@@ -2667,12 +2727,10 @@ class OpenAIBackendAPI:
         p_token = build_legacy_requirements_token(self.user_agent, self.pow_script_sources, self.pow_data_build)
 
         prepare_path = base + "/prepare"
-        response = self.session.post(
-            self.base_url + prepare_path,
-            headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
-            json={"p": p_token},
-            timeout=30,
-        )
+        response = self._request("post", self.base_url + prepare_path,
+        headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
+        json={"p": p_token},
+        timeout=self._request_timeout(30),)
         ensure_ok(response, "chat_requirements_prepare")
         prepare_data = response.json()
 
@@ -2696,16 +2754,14 @@ class OpenAIBackendAPI:
             turnstile_token = solve_turnstile_token(turnstile_info["dx"], p_token) or ""
 
         finalize_path = base + "/finalize"
-        response = self.session.post(
-            self.base_url + finalize_path,
-            headers=self._headers(finalize_path, {"Content-Type": "application/json"}),
-            json={
-                "prepare_token": prepare_data.get("prepare_token", ""),
-                "proof_token": proof_token,
-                "turnstile_token": turnstile_token,
-            },
-            timeout=30,
-        )
+        response = self._request("post", self.base_url + finalize_path,
+        headers=self._headers(finalize_path, {"Content-Type": "application/json"}),
+        json={
+            "prepare_token": prepare_data.get("prepare_token", ""),
+            "proof_token": proof_token,
+            "turnstile_token": turnstile_token,
+        },
+        timeout=self._request_timeout(30),)
         ensure_ok(response, "chat_requirements_finalize")
         data = response.json()
 
@@ -2735,11 +2791,9 @@ class OpenAIBackendAPI:
         )
         route = "/backend-api/models" if self.access_token else "/backend-anon/models"
         context = "auth_models" if self.access_token else "anon_models"
-        response = self.session.get(
-            self.base_url + path,
-            headers=self._headers(route),
-            timeout=30,
-        )
+        response = self._request("get", self.base_url + path,
+        headers=self._headers(route),
+        timeout=self._request_timeout(30),)
         ensure_ok(response, context)
         data = []
         seen = set()

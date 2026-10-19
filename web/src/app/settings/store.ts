@@ -186,6 +186,8 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     base_url: typeof config.base_url === "string" ? config.base_url : "",
     global_system_prompt: String(config.global_system_prompt || ""),
     default_upstream_model_name: String(config.default_upstream_model_name || "gpt-5-5"),
+    default_upstream_model_name_25: String(config.default_upstream_model_name_25 || ""),
+    codex_image_model_25_name: String(config.codex_image_model_25_name || "gpt-image-2.5-flare"),
     default_thinking_effort: defaultThinkingEffort,
     sensitive_words: Array.isArray(config.sensitive_words) ? config.sensitive_words : [],
     ai_review: {
@@ -309,6 +311,8 @@ type SettingsStore = {
   setBaseUrl: (value: string) => void;
   setGlobalSystemPrompt: (value: string) => void;
   setDefaultUpstreamModelName: (value: string) => void;
+  setDefaultUpstreamModelName25: (value: string) => void;
+  setCodexImageModel25Name: (value: string) => void;
   setDefaultThinkingEffort: (value: "auto" | "standard" | "extended" | "max") => void;
   setSensitiveWordsText: (value: string) => void;
   setAIReviewField: (key: "enabled" | "base_url" | "api_key" | "model" | "prompt", value: string | boolean) => void;
@@ -403,7 +407,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         config: normalized,
       });
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "加载系统配置失败");
+      toast.error(error instanceof Error ? error.message : "Failed to load settings");
     } finally {
       set({ isLoadingConfig: false });
     }
@@ -436,6 +440,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         base_url: String(config.base_url || "").trim(),
         global_system_prompt: String(config.global_system_prompt || "").trim(),
         default_upstream_model_name: String(config.default_upstream_model_name || "gpt-5-5").trim() || "gpt-5-5",
+        default_upstream_model_name_25: String(config.default_upstream_model_name_25 || "").trim(),
+        codex_image_model_25_name: String(config.codex_image_model_25_name || "gpt-image-2.5-flare").trim() || "gpt-image-2.5-flare",
         default_thinking_effort: ["standard", "extended", "max"].includes(String(config.default_thinking_effort))
           ? config.default_thinking_effort
           : "auto",
@@ -498,10 +504,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         config: normalizeConfig(data.config),
       });
       window.dispatchEvent(new Event("third-party-apps-updated"));
-      toast.success("配置已保存");
+      toast.success("Settings saved");
       return true;
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "保存系统配置失败");
+      toast.error(error instanceof Error ? error.message : "Failed to save settings");
       return false;
     } finally {
       set({ isSavingConfig: false });
@@ -614,6 +620,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setDefaultUpstreamModelName: (value) => {
     set((state) => state.config ? { config: { ...state.config, default_upstream_model_name: value } } : {});
+  },
+
+  setDefaultUpstreamModelName25: (value) => {
+    set((state) => state.config ? { config: { ...state.config, default_upstream_model_name_25: value } } : {});
+  },
+
+  setCodexImageModel25Name: (value) => {
+    set((state) => state.config ? { config: { ...state.config, codex_image_model_25_name: value } } : {});
   },
 
   setDefaultThinkingEffort: (value) => {
@@ -745,12 +759,12 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       }
       const data = await testImageStorageConnection();
       if (data.result.ok) {
-        toast.success(`WebDAV 连接可用：HTTP ${data.result.status}`);
+        toast.success(`WebDAV connection available: HTTP ${data.result.status}`);
       } else {
-        toast.error(`WebDAV 连接失败：${data.result.error ?? `HTTP ${data.result.status}`}`);
+        toast.error(`WebDAV connection failed: ${data.result.error ?? `HTTP ${data.result.status}`}`);
       }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "测试 WebDAV 失败");
+      toast.error(error instanceof Error ? error.message : "WebDAV test failed");
     } finally {
       set({ isTestingImageStorage: false });
     }
@@ -764,9 +778,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         return;
       }
       const data = await syncImageStorage();
-      toast.success(`同步完成：上传 ${data.result.uploaded}，跳过 ${data.result.skipped}，失败 ${data.result.failed}`);
+      toast.success(`Sync complete: uploaded ${data.result.uploaded}, skipped ${data.result.skipped}, failed ${data.result.failed}`);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "同步图片失败");
+      toast.error(error instanceof Error ? error.message : "Image sync failed");
     } finally {
       set({ isSyncingImageStorage: false });
     }
@@ -821,7 +835,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       });
     } catch (error) {
       if (!silent) {
-        toast.error(error instanceof Error ? error.message : "加载备份列表失败");
+        toast.error(error instanceof Error ? error.message : "Failed to load backups");
       }
     } finally {
       if (!silent) {
@@ -838,10 +852,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         return;
       }
       const data = await runBackupNow();
-      toast.success(`备份已完成：${data.result.key}`);
+      toast.success(`Backup completed: ${data.result.key}`);
       await get().loadBackups(true);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "执行备份失败");
+      toast.error(error instanceof Error ? error.message : "Backup failed");
     } finally {
       set({ isRunningBackup: false });
     }
@@ -851,10 +865,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     set({ deletingBackupKey: key });
     try {
       await deleteBackup(key);
-      toast.success("备份已删除");
+      toast.success("Backup deleted");
       await get().loadBackups(true);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "删除备份失败");
+      toast.error(error instanceof Error ? error.message : "Failed to delete backup");
     } finally {
       set({ deletingBackupKey: null });
     }
@@ -868,9 +882,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         return;
       }
       const data = await testBackupConnection();
-      toast.success(`R2 连接正常（HTTP ${data.result.status}）`);
+      toast.success(`R2 connection OK (HTTP ${data.result.status})`);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "测试备份连接失败");
+      toast.error(error instanceof Error ? error.message : "Backup connection test failed");
     } finally {
       set({ isTestingBackup: false });
     }
@@ -885,7 +899,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       set({ pools: data.pools });
     } catch (error) {
       if (!silent) {
-        toast.error(error instanceof Error ? error.message : "加载 CPA 连接失败");
+        toast.error(error instanceof Error ? error.message : "Failed to load CPA pools");
       }
     } finally {
       if (!silent) {
@@ -939,11 +953,11 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   savePool: async () => {
     const { editingPool, formName, formBaseUrl, formSecretKey } = get();
     if (!formBaseUrl.trim()) {
-      toast.error("请输入 CPA 地址");
+      toast.error("Please enter a CPA address");
       return;
     }
     if (!editingPool && !formSecretKey.trim()) {
-      toast.error("请输入 Secret Key");
+      toast.error("Please enter a Secret Key");
       return;
     }
 
@@ -956,7 +970,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           secret_key: formSecretKey.trim() || undefined,
         });
         set({ pools: data.pools, dialogOpen: false });
-        toast.success("连接已更新");
+        toast.success("Connection updated");
       } else {
         const data = await createCPAPool({
           name: formName.trim(),
@@ -964,10 +978,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           secret_key: formSecretKey.trim(),
         });
         set({ pools: data.pools, dialogOpen: false });
-        toast.success("连接已添加");
+        toast.success("Connection added");
       }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "保存失败");
+      toast.error(error instanceof Error ? error.message : "Save failed");
     } finally {
       set({ isSavingPool: false });
     }
@@ -978,9 +992,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     try {
       const data = await deleteCPAPool(pool.id);
       set({ pools: data.pools });
-      toast.success("连接已删除");
+      toast.success("Connection deleted");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "删除失败");
+      toast.error(error instanceof Error ? error.message : "Delete failed");
     } finally {
       set({ deletingId: null });
     }
@@ -999,9 +1013,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         filePage: 1,
         browserOpen: true,
       });
-      toast.success(`读取成功，共 ${files.length} 个远程账号`);
+      toast.success(`Loaded ${files.length} remote accounts`);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "读取远程账号失败");
+      toast.error(error instanceof Error ? error.message : "Failed to load remote accounts");
     } finally {
       set({ loadingFilesId: null });
     }
@@ -1046,7 +1060,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       return;
     }
     if (selectedNames.length === 0) {
-      toast.error("请先选择要导入的账号");
+      toast.error("Please select accounts to import");
       return;
     }
 
@@ -1059,9 +1073,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         ),
         browserOpen: false,
       });
-      toast.success("导入任务已启动");
+      toast.success("Import started");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "启动导入失败");
+      toast.error(error instanceof Error ? error.message : "Failed to start import");
     } finally {
       set({ isStartingImport: false });
     }
